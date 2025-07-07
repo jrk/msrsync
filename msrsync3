@@ -265,7 +265,13 @@ class OptDict(object): # pragma: no cover
         return _invert(self._opts[k], invert)
 
     def __getattr__(self, k):
-        return self[k]
+        # Prevent infinite recursion during pickling by checking if this looks like an option key
+        if k.startswith('_'):
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{k}'")
+        try:
+            return self[k]
+        except KeyError:
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{k}'")
 
 
 def _default_onabort(msg): # pragma: no cover
@@ -453,7 +459,8 @@ def print_message(message, output=MSG_STDOUT):
     """
     Add message to the message queue
     """
-    G_MESSAGES_QUEUE.put({"type": output, "message": message})
+    if G_MESSAGES_QUEUE is not None:
+        G_MESSAGES_QUEUE.put({"type": output, "message": message})
 
 
 def print_update(data):
@@ -661,6 +668,7 @@ def parse_cmdline(cmdline_argv):
         options.fatal("'%s' does not look like a valid files number value" % opt.f)
     opt.size = opt.s = size # pylint: disable=invalid-name, attribute-defined-outside-init
     opt.compress = False # pylint: disable=attribute-defined-outside-init
+    opt.rsync_exe = None # pylint: disable=attribute-defined-outside-init
 
     return opt, srcs, dest
 
@@ -838,10 +846,13 @@ def run_rsync(files_from, rsync_opts, src, dest, timeout=3600*24*7):
     return rsync_result
 
 
-def rsync_worker(jobs_queue, monitor_queue, options, dest):
+def rsync_worker(jobs_queue, monitor_queue, options, dest, messages_queue):
     """
     The queue will contains filenames of file to handle by individual rsync processes
     """
+    global G_MESSAGES_QUEUE, RSYNC_EXE
+    G_MESSAGES_QUEUE = messages_queue
+    RSYNC_EXE = options.rsync_exe
 
     try:
         for src, files_from, bucket_files_nr, bucket_size in consume_queue(jobs_queue):
@@ -876,10 +887,12 @@ def handle_rsync_error_result(rsync_result):
         print_message("unknown rsync_result status: %s" % rsync_result, MSG_STDERR)
 
 
-def rsync_monitor_worker(monitor_queue, nb_rsync_processes, total_size, total_files_nr, crawl_time, total_time, options):
+def rsync_monitor_worker(monitor_queue, nb_rsync_processes, total_size, total_files_nr, crawl_time, total_time, options, messages_queue):
     """
     The monitor queue contains messages from the rsync workers
     """
+    global G_MESSAGES_QUEUE
+    G_MESSAGES_QUEUE = messages_queue
     current_size = 0
     current_files_nr = 0
     current_elapsed = 0
@@ -958,10 +971,12 @@ def rsync_monitor_worker(monitor_queue, nb_rsync_processes, total_size, total_fi
         pass
 
 
-def messages_worker(options):
+def messages_worker(options, messages_queue):
     """
     This queue will contains messages to be print of the screen
     """
+    global G_MESSAGES_QUEUE
+    G_MESSAGES_QUEUE = messages_queue
 
     last_msg_type = cur_msg_type = None
     try:
@@ -989,31 +1004,31 @@ def messages_worker(options):
         if last_msg_type == MSG_PROGRESS:
             print('', file=sys.stdout)
 
-def start_rsync_workers(jobs_queue, monitor_queue, options, dest):
+def start_rsync_workers(jobs_queue, monitor_queue, options, dest, messages_queue):
     """
     Helper to start rsync processes
     """
     processes = []
     for _ in range(options.processes):
-        processes.append(multiprocessing.Process(target=rsync_worker, args=(jobs_queue, monitor_queue, options, dest)))
+        processes.append(multiprocessing.Process(target=rsync_worker, args=(jobs_queue, monitor_queue, options, dest, messages_queue)))
         processes[-1].start()
     return processes
 
 
-def start_rsync_monitor_worker(monitor_queue, nb_rsync_processes, total_size, total_files_nr, crawl_time, total_time, options):
+def start_rsync_monitor_worker(monitor_queue, nb_rsync_processes, total_size, total_files_nr, crawl_time, total_time, options, messages_queue):
     """
     Helper to start rsync monitor process
     """
-    proc = multiprocessing.Process(target=rsync_monitor_worker, args=(monitor_queue, nb_rsync_processes, total_size, total_files_nr, crawl_time, total_time, options))
+    proc = multiprocessing.Process(target=rsync_monitor_worker, args=(monitor_queue, nb_rsync_processes, total_size, total_files_nr, crawl_time, total_time, options, messages_queue))
     proc.start()
     return proc
 
 
-def start_messages_worker(options):
+def start_messages_worker(options, messages_queue):
     """
     Helper to start messages process
     """
-    proc = multiprocessing.Process(target=messages_worker, args=(options,))
+    proc = multiprocessing.Process(target=messages_worker, args=(options, messages_queue))
     proc.start()
     return proc
 
@@ -1092,9 +1107,9 @@ def msrsync(options, srcs, dest):
     jobs_queue = manager.Queue() # pylint: disable=no-member
     G_MESSAGES_QUEUE = manager.Queue() # pylint: disable=no-member
 
-    rsync_workers_procs = start_rsync_workers(jobs_queue, monitor_queue, options, dest)
-    rsync_monitor_worker_proc = start_rsync_monitor_worker(monitor_queue, options.processes, total_size, total_files_nr, crawl_time, total_time, options)
-    messages_worker_proc = start_messages_worker(options)
+    rsync_workers_procs = start_rsync_workers(jobs_queue, monitor_queue, options, dest, G_MESSAGES_QUEUE)
+    rsync_monitor_worker_proc = start_rsync_monitor_worker(monitor_queue, options.processes, total_size, total_files_nr, crawl_time, total_time, options, G_MESSAGES_QUEUE)
+    messages_worker_proc = start_messages_worker(options, G_MESSAGES_QUEUE)
 
     crawl_start = timeit.default_timer()
 
@@ -1805,6 +1820,7 @@ def main(cmdline):
         sys.exit(0)
 
     _check_executables()
+    options.rsync_exe = RSYNC_EXE  # Store rsync executable path in options for worker processes
     _check_srcs_dest(srcs, dest)
     _check_rsync_options(options.rsync)
     return msrsync(options, srcs, dest)
